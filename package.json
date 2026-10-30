@@ -1,0 +1,15 @@
+{
+  "name": "casecellshop-backend",
+  "version": "1.0.0",
+  "description": "CaseCellShop - catálogo com cache, checkout assíncrono e status de pedido (desafio técnico)",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node src/main.ts",
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "license": "MIT"
+}

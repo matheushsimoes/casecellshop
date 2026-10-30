@@ -1,0 +1,208 @@
+openapi: 3.0.3
+info:
+  title: CaseCellShop API
+  version: 1.0.0
+  description: |
+    Catálogo com cache, checkout assíncrono e acompanhamento de pedido.
+    Todas as respostas trazem o header `x-correlation-id` (o recebido, ou um novo).
+    Erros seguem a RFC 7807 (`application/problem+json`).
+servers:
+  - url: http://localhost:3000
+paths:
+  /products:
+    get:
+      summary: Lista produtos com preço (cacheado) e disponibilidade (tempo real)
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Lista de produtos
+          headers:
+            x-cache:
+              description: Origem do dado de catálogo
+              schema: { type: string, enum: [HIT, MISS, STALE] }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProductList' }
+        '503':
+          description: ERP fora do ar e nenhum dado de cache utilizável
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /checkout:
+    post:
+      summary: Inicia uma compra (processamento assíncrono)
+      description: |
+        Reserva o estoque de forma atômica, grava o pedido e responde 202.
+        O faturamento no ERP acontece em background; acompanhe pelo statusUrl.
+        Repetir a chamada com a mesma Idempotency-Key e o mesmo corpo devolve o mesmo pedido.
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: Identificador único da intenção de compra (UUID recomendado), gerado pelo cliente.
+          schema: { type: string, minLength: 8, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CheckoutRequest' }
+            example:
+              items:
+                - { sku: CASE-IP15-BLK, quantity: 2 }
+      responses:
+        '202':
+          description: Pedido aceito (ou repetição idempotente de um pedido já aceito)
+          headers:
+            Location:
+              description: URL de acompanhamento do pedido
+              schema: { type: string }
+            Idempotent-Replayed:
+              description: Presente com valor "true" quando a resposta é de um pedido já existente
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CheckoutAccepted' }
+        '400':
+          description: Payload inválido ou Idempotency-Key ausente
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ValidationProblem' }
+        '409':
+          description: Estoque insuficiente
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/OutOfStockProblem' }
+        '422':
+          description: Idempotency-Key já usada com outro payload
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /orders/{orderId}/status:
+    get:
+      summary: Consulta o status de processamento do pedido
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - name: orderId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Status atual
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderStatus' }
+        '404':
+          description: Pedido não encontrado
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /metrics:
+    get:
+      summary: Métricas no formato Prometheus/OpenMetrics (coletadas pelo Datadog Agent)
+      responses:
+        '200':
+          description: Métricas
+          content:
+            text/plain: { schema: { type: string } }
+  /health:
+    get:
+      summary: Liveness
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { status: { type: string, example: ok } } }
+components:
+  parameters:
+    CorrelationId:
+      name: x-correlation-id
+      in: header
+      required: false
+      description: Propagado em logs, traces e na resposta. Gerado se ausente.
+      schema: { type: string }
+  schemas:
+    Product:
+      type: object
+      required: [sku, name, priceCents, available, inStock]
+      properties:
+        sku: { type: string, example: CASE-IP15-BLK }
+        name: { type: string, example: Capinha iPhone 15 Preta }
+        priceCents: { type: integer, example: 4990 }
+        available: { type: integer, example: 10 }
+        inStock: { type: boolean }
+    ProductList:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { type: array, items: { $ref: '#/components/schemas/Product' } }
+        meta:
+          type: object
+          properties:
+            cache: { type: string, enum: [HIT, MISS, STALE] }
+            dataAgeSeconds: { type: number, description: Idade do dado de catálogo servido }
+    LineItem:
+      type: object
+      required: [sku, quantity]
+      properties:
+        sku: { type: string }
+        quantity: { type: integer, minimum: 1, maximum: 10 }
+    CheckoutRequest:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items: { $ref: '#/components/schemas/LineItem' }
+    CheckoutAccepted:
+      type: object
+      required: [orderId, status, statusUrl]
+      properties:
+        orderId: { type: string, format: uuid }
+        status: { type: string, enum: [PENDING, PROCESSING, CONFIRMED, FAILED] }
+        statusUrl: { type: string, example: /orders/3f2a.../status }
+    OrderStatus:
+      type: object
+      required: [orderId, status, items, attempts, createdAt, updatedAt]
+      properties:
+        orderId: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [PENDING, PROCESSING, CONFIRMED, FAILED]
+          description: |
+            PENDING: aceito, estoque reservado, aguardando envio ao ERP.
+            PROCESSING: em faturamento (pode estar em retry).
+            CONFIRMED: faturado no ERP; reserva convertida em venda.
+            FAILED: falhou após as tentativas; reserva liberada.
+        items: { type: array, items: { $ref: '#/components/schemas/LineItem' } }
+        attempts: { type: integer }
+        invoiceId: { type: string, nullable: true }
+        failureReason: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    Problem:
+      type: object
+      required: [type, title, status, detail]
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        correlationId: { type: string }
+    ValidationProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            errors: { type: array, items: { type: string } }
+    OutOfStockProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            skus: { type: array, items: { type: string } }
